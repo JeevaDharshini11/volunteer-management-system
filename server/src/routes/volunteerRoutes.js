@@ -1,56 +1,82 @@
 import express from "express";
+import { mapUser, pool } from "../config/db.js";
 import { protect, requireAdmin } from "../middleware/auth.js";
-import User from "../models/User.js";
 
 const router = express.Router();
 
 router.get("/", protect, requireAdmin, async (req, res) => {
   const { skill, availability, status } = req.query;
-  const query = { role: "volunteer" };
+  const values = [];
+  const conditions = ["role = 'volunteer'"];
 
-  if (skill) query.skills = { $regex: skill, $options: "i" };
-  if (availability) query.availability = { $regex: availability, $options: "i" };
-  if (status) query.status = status;
+  if (skill) {
+    values.push(`%${skill}%`);
+    conditions.push(`exists (select 1 from unnest(skills) item where item ilike $${values.length})`);
+  }
 
-  const volunteers = await User.find(query).select("-password").sort({ createdAt: -1 });
-  res.json(volunteers);
+  if (availability) {
+    values.push(`%${availability}%`);
+    conditions.push(`exists (select 1 from unnest(availability) item where item ilike $${values.length})`);
+  }
+
+  if (status) {
+    values.push(status);
+    conditions.push(`status = $${values.length}`);
+  }
+
+  const { rows } = await pool.query(
+    `select * from users where ${conditions.join(" and ")} order by created_at desc`,
+    values
+  );
+
+  res.json(rows.map(mapUser));
 });
 
 router.put("/:id/status", protect, requireAdmin, async (req, res) => {
-  const { status } = req.body;
-  const volunteer = await User.findOneAndUpdate(
-    { _id: req.params.id, role: "volunteer" },
-    { status },
-    { new: true, runValidators: true }
-  ).select("-password");
+  const { rows } = await pool.query(
+    `update users
+     set status = $1, updated_at = now()
+     where id = $2 and role = 'volunteer'
+     returning *`,
+    [req.body.status, req.params.id]
+  );
 
-  if (!volunteer) {
+  if (!rows[0]) {
     return res.status(404).json({ message: "Volunteer not found" });
   }
 
-  res.json(volunteer);
+  res.json(mapUser(rows[0]));
 });
 
 router.put("/profile", protect, async (req, res) => {
-  const allowed = ["name", "phone", "skills", "availability", "experience"];
-  const updates = {};
+  const { name, phone, skills, availability, experience } = req.body;
+  const { rows } = await pool.query(
+    `update users
+     set name = coalesce($1, name),
+         phone = coalesce($2, phone),
+         skills = coalesce($3, skills),
+         availability = coalesce($4, availability),
+         experience = coalesce($5, experience),
+         updated_at = now()
+     where id = $6
+     returning *`,
+    [
+      name ?? null,
+      phone ?? null,
+      Array.isArray(skills) ? skills : null,
+      Array.isArray(availability) ? availability : null,
+      experience ?? null,
+      req.user._id
+    ]
+  );
 
-  allowed.forEach((field) => {
-    if (req.body[field] !== undefined) updates[field] = req.body[field];
-  });
-
-  const volunteer = await User.findByIdAndUpdate(req.user._id, updates, {
-    new: true,
-    runValidators: true
-  }).select("-password");
-
-  res.json(volunteer);
+  res.json(mapUser(rows[0]));
 });
 
 router.delete("/:id", protect, requireAdmin, async (req, res) => {
-  const volunteer = await User.findOneAndDelete({ _id: req.params.id, role: "volunteer" });
+  const { rowCount } = await pool.query("delete from users where id = $1 and role = 'volunteer'", [req.params.id]);
 
-  if (!volunteer) {
+  if (!rowCount) {
     return res.status(404).json({ message: "Volunteer not found" });
   }
 

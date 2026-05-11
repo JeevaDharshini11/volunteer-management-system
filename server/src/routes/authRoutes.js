@@ -1,6 +1,7 @@
+import bcrypt from "bcryptjs";
 import express from "express";
 import jwt from "jsonwebtoken";
-import User from "../models/User.js";
+import { mapUser, pool } from "../config/db.js";
 import { protect } from "../middleware/auth.js";
 
 const router = express.Router();
@@ -11,38 +12,41 @@ function createToken(user) {
   });
 }
 
-function sanitizeUser(user) {
-  const plain = user.toObject();
-  delete plain.password;
-  return plain;
-}
-
 router.post("/register", async (req, res) => {
   try {
     const { name, email, password, phone, skills, availability, experience, role } = req.body;
-    const existingUser = await User.findOne({ email });
+    const passwordHash = await bcrypt.hash(password, 10);
+    const normalizedRole = role === "admin" ? "admin" : "volunteer";
+    const status = normalizedRole === "admin" ? "approved" : "pending";
 
-    if (existingUser) {
-      return res.status(409).json({ message: "Email is already registered" });
-    }
+    const { rows } = await pool.query(
+      `insert into users (name, email, password_hash, phone, role, status, skills, availability, experience)
+       values ($1, lower($2), $3, $4, $5, $6, $7, $8, $9)
+       returning *`,
+      [
+        name,
+        email,
+        passwordHash,
+        phone || null,
+        normalizedRole,
+        status,
+        Array.isArray(skills) ? skills : [],
+        Array.isArray(availability) ? availability : [],
+        experience || null
+      ]
+    );
 
-    const user = await User.create({
-      name,
-      email,
-      password,
-      phone,
-      role: role === "admin" ? "admin" : "volunteer",
-      status: role === "admin" ? "approved" : "pending",
-      skills,
-      availability,
-      experience
-    });
+    const user = mapUser(rows[0]);
 
     res.status(201).json({
-      user: sanitizeUser(user),
+      user,
       token: createToken(user)
     });
   } catch (error) {
+    if (error.code === "23505") {
+      return res.status(409).json({ message: "Email is already registered" });
+    }
+
     res.status(400).json({ message: error.message });
   }
 });
@@ -50,18 +54,21 @@ router.post("/register", async (req, res) => {
 router.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await User.findOne({ email });
+    const { rows } = await pool.query("select * from users where email = lower($1)", [email]);
+    const dbUser = rows[0];
 
-    if (!user || !(await user.comparePassword(password))) {
+    if (!dbUser || !(await bcrypt.compare(password, dbUser.password_hash))) {
       return res.status(401).json({ message: "Invalid email or password" });
     }
 
-    if (user.status === "rejected") {
+    if (dbUser.status === "rejected") {
       return res.status(403).json({ message: "Your registration was rejected" });
     }
 
+    const user = mapUser(dbUser);
+
     res.json({
-      user: sanitizeUser(user),
+      user,
       token: createToken(user)
     });
   } catch (error) {
